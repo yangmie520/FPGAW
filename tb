@@ -1,0 +1,127 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity tb_top_canny_vga_comp is
+end entity;
+
+architecture sim of tb_top_canny_vga_comp is
+  constant CLK_PERIOD : time := 10 ns;  -- 100 MHz
+  constant IN_W       : integer := 100;
+  constant IN_H       : integer := 100;
+  constant FRAME_PIX  : integer := IN_W * IN_H;
+
+  signal sys_clk   : std_logic := '0';
+  signal reset     : std_logic := '1';
+  signal start_btn : std_logic := '0';
+
+  -- DUT ports
+  signal o_h_sync, o_v_sync : std_logic;
+  signal o_red, o_green, o_blue : std_logic_vector(3 downto 0);
+
+  signal frame_done_o       : std_logic;
+  signal write_done_o       : std_logic;
+  signal edge_valid_count_o : unsigned(15 downto 0);
+
+  -- RAM B read
+  signal dbg_clk_b  : std_logic := '0';
+  signal dbg_addr_b : unsigned(13 downto 0) := (others=>'0');
+  signal dbg_dout_b : std_logic_vector(7 downto 0);
+
+  -- 讀出統計
+  type ram_capture_t is array (0 to FRAME_PIX-1) of std_logic_vector(7 downto 0);
+  signal ram_capture : ram_capture_t;
+
+  signal read_done : std_logic := '0';
+
+  -- 統計結果
+  signal cnt_zero : integer := 0;
+  signal cnt_80   : integer := 0;
+  signal cnt_ff   : integer := 0;
+  signal cnt_other: integer := 0;
+begin
+  --------------------------------------------------
+  -- Clock generation
+  --------------------------------------------------
+  sys_clk <= not sys_clk after CLK_PERIOD/2;
+  -- 使用同一時鐘讀 RAM B，簡化模擬
+  dbg_clk_b <= sys_clk;
+
+  --------------------------------------------------
+  -- DUT
+  --------------------------------------------------
+  uut : entity work.top_canny_vga_comp
+    port map (
+      sys_clk   => sys_clk,
+      reset     => reset,
+      start     => start_btn,
+      o_h_sync  => o_h_sync,
+      o_v_sync  => o_v_sync,
+      o_red     => o_red,
+      o_green   => o_green,
+      o_blue    => o_blue,
+      frame_done_o        => frame_done_o,
+      write_done_o        => write_done_o,
+      edge_valid_count_o  => edge_valid_count_o,
+      dbg_clk_b  => dbg_clk_b,
+      dbg_addr_b => dbg_addr_b,
+      dbg_dout_b => dbg_dout_b
+    );
+
+  --------------------------------------------------
+  -- Stimulus
+  --------------------------------------------------
+  process
+  begin
+    -- Reset
+    reset <= '1';
+    wait for 100 ns;
+    reset <= '0';
+    wait for 50 ns;
+
+    -- 發出單次 start 脈衝
+    start_btn <= '1';
+    wait for CLK_PERIOD;
+    start_btn <= '0';
+
+    -- 等待寫完成
+    wait until write_done_o='1';
+    report "Write done asserted. edgeValid count=" &
+      integer'image(to_integer(edge_valid_count_o));
+
+    -- 讀出 RAM 全部內容
+    for i in 0 to FRAME_PIX-1 loop
+      dbg_addr_b <= to_unsigned(i, dbg_addr_b'length);
+      wait for CLK_PERIOD;  -- 等一拍取資料
+      ram_capture(i) <= dbg_dout_b;
+    end loop;
+    read_done <= '1';
+
+    -- 統計
+    for i in 0 to FRAME_PIX-1 loop
+      if ram_capture(i)=x"00" then
+        cnt_zero <= cnt_zero + 1;
+      elsif ram_capture(i)=x"80" then
+        cnt_80   <= cnt_80 + 1;
+      elsif ram_capture(i)=x"FF" then
+        cnt_ff   <= cnt_ff + 1;
+      else
+        cnt_other<= cnt_other + 1;
+      end if;
+    end loop;
+
+    wait for 100 ns;
+    report "RAM statistics: zero=" & integer'image(cnt_zero) &
+           " 0x80=" & integer'image(cnt_80) &
+           " 0xFF=" & integer'image(cnt_ff) &
+           " other=" & integer'image(cnt_other);
+
+    -- 可加斷言條件（例：至少有若干邊緣）
+    assert cnt_ff + cnt_80 > 10
+      report "Edge pixels too few - check edgeValid gating."
+      severity warning;
+
+    wait;
+  end process;
+
+end architecture;
