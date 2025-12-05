@@ -1,0 +1,121 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+-- V6: 核心影像寫入器 (Center-Crop Writer)
+-- 假設 Canny 輸出的是 98x98 的有效影像 (左右上下各切1)
+-- 我們將其寫入 100x100 的 RAM 中央，自動補黑邊
+entity edge_frame_writer is
+  generic (
+    IN_W      : integer := 100;
+    IN_H      : integer := 100;
+    ADDR_BITS : integer := 14
+  );
+  port (
+    clk        : in  std_logic;
+    reset      : in  std_logic;
+    edgePix    : in  std_logic_vector(8 downto 0);
+    edgeValid  : in  std_logic;
+    start      : in  std_logic;               
+    done_in    : in  std_logic;         
+    ram_we     : out std_logic;
+    ram_addr   : out unsigned(ADDR_BITS-1 downto 0);
+    ram_din    : out std_logic_vector(7 downto 0);
+    write_done : out std_logic
+  );
+end entity;
+
+architecture rtl of edge_frame_writer is
+  -- 預設有效寬度 (100 - 2 = 98)
+  constant VALID_W : integer := IN_W - 2;
+  
+  -- 行/列計數 (針對有效區域)
+  signal col_cnt   : integer range 0 to VALID_W-1 := 0;
+  signal row_cnt   : integer range 0 to IN_H-1 := 0;
+  
+  -- 實際寫入 RAM 的位址
+  signal waddr     : unsigned(ADDR_BITS-1 downto 0) := (others=>'0');
+  
+  type state_t is (IDLE, WAIT_FIRST, WRITING, DONE);
+  signal state : state_t := IDLE;
+
+begin
+
+  process(clk, reset)
+    -- 計算目標 RAM 位址： (row_cnt + 1) * 100 + (col_cnt + 1)
+    -- 也就是從 (1,1) 開始寫，避開邊框
+    variable dest_row : integer;
+    variable dest_col : integer;
+  begin
+    if reset='1' then
+      state      <= IDLE;
+      col_cnt    <= 0;
+      row_cnt    <= 0;
+      ram_we     <= '0';
+      ram_din    <= (others=>'0');
+      write_done <= '0';
+      waddr      <= (others=>'0');
+      
+    elsif rising_edge(clk) then
+      -- 預設
+      ram_we     <= '0';
+      write_done <= '0';
+
+      case state is
+        when IDLE =>
+          if start='1' then
+            state   <= WAIT_FIRST;
+            col_cnt <= 0;
+            row_cnt <= 0;
+          end if;
+
+        when WAIT_FIRST =>
+          if edgeValid='1' then
+            state <= WRITING;
+            -- 處理第一筆
+            col_cnt <= 1; -- 下一筆是 1
+            row_cnt <= 0;
+            
+            -- 計算第一筆位址: 第0行(實際RAM第1行) + 第0列(實際RAM第1列)
+            -- 100 + 1 = 101
+            ram_addr <= to_unsigned(1 * IN_W + 1, ADDR_BITS);
+            ram_we   <= '1';
+            ram_din  <= edgePix(7 downto 0);
+          end if;
+
+        when WRITING =>
+          if edgeValid='1' then
+            -- 寫入資料
+            ram_we  <= '1';
+            ram_din <= edgePix(7 downto 0);
+            
+            -- 計算目前位址 (補償 1 像素邊框)
+            -- Row: row_cnt + 1 (避開第0行)
+            -- Col: col_cnt + 1 (避開第0列)
+            ram_addr <= to_unsigned((row_cnt + 1) * IN_W + (col_cnt + 1), ADDR_BITS);
+            
+            -- 計數器更新
+            if col_cnt = VALID_W - 1 then
+              -- 這一行寫滿 98 點了，換行
+              col_cnt <= 0;
+              if row_cnt = IN_H - 3 then -- 扣掉上下各1，共98行 (0~97)
+                state <= DONE;
+              else
+                row_cnt <= row_cnt + 1;
+              end if;
+            else
+              col_cnt <= col_cnt + 1;
+            end if;
+          end if;
+
+        when DONE =>
+          write_done <= '1';
+          if start='1' then
+            state <= WAIT_FIRST;
+          end if;
+          
+      end case;
+    end if;
+  end process;
+
+end architecture;       
