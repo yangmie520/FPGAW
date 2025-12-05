@@ -1,7 +1,6 @@
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
--- 引用 Xilinx 原語庫 (為了解決時鐘錯誤)
 library UNISIM;
 use UNISIM.vcomponents.all;
 
@@ -30,17 +29,19 @@ architecture rtl of top_canny_vga_comp is
   constant HIGH_T : std_logic_vector(8 downto 0) := "010000111";  -- 135
 
   -- 時鐘訊號
-  signal div_reg       : std_logic := '0'; -- 分頻用暫存器
-  signal pixel_clk_raw : std_logic := '0'; -- 分頻後的原始訊號
-  signal pixel_clk     : std_logic;        -- 經過 BUFG 的全域時鐘
+  signal div_reg       : std_logic := '0';
+  signal pixel_clk_raw : std_logic := '0';
+  signal pixel_clk     : std_logic;
 
-  -- start 同步與單次脈衝
+  -- 按鍵同步
   signal start_sync1, start_sync2 : std_logic := '0';
-  signal start_prev               : std_logic := '0';
   signal start_pulse              : std_logic := '0';
 
-  -- 混合重置訊號 (只給 Canny 用)
-  signal canny_reset : std_logic := '0';
+  -- 序列控制器訊號
+  signal seq_cnt      : integer range 0 to 31 := 0;
+  signal seq_running  : std_logic := '0';
+  signal canny_reset_internal : std_logic := '0';
+  signal rom_start_internal   : std_logic := '0';
 
   -- 內部連接信號
   signal pixelIn     : std_logic_vector(8 downto 0);
@@ -61,7 +62,7 @@ architecture rtl of top_canny_vga_comp is
   signal vga_addr    : unsigned(13 downto 0);
   signal vga_dout    : std_logic_vector(7 downto 0);
 
-  -- 元件宣告
+  -- Component 宣告
   component img_bram
     port (
       clka  : in  std_logic;
@@ -145,21 +146,22 @@ architecture rtl of top_canny_vga_comp is
     );
   end component;
 
+  -- 修正後的 VGA Component 宣告
   component vga_edge_display
     generic(
-      H_RES   : integer;
-      H_FP    : integer;
-      H_SYNC  : integer;
-      H_BP    : integer;
-      H_POL   : std_logic;
-      V_RES   : integer;
-      V_FP    : integer;
-      V_SYNC  : integer;
-      V_BP    : integer;
-      V_POL   : std_logic;
-      IN_W    : integer;
-      IN_H    : integer;
-      SCALE_K : integer
+      H_RES   : integer := 800;
+      H_FP    : integer := 56;
+      H_SYNC  : integer := 120;
+      H_BP    : integer := 64;
+      H_POL   : std_logic := '1';
+      V_RES   : integer := 600;
+      V_FP    : integer := 37;
+      V_SYNC  : integer := 6;
+      V_BP    : integer := 23;
+      V_POL   : std_logic := '1';
+      IN_W    : integer := 100;
+      IN_H    : integer := 100;
+      SCALE_K : integer := 4
     );
     port (
       pixel_clk : in  std_logic;
@@ -176,7 +178,7 @@ architecture rtl of top_canny_vga_comp is
 
 begin
   --------------------------------------------------
-  -- 時鐘生成：100MHz -> 50MHz (加入 BUFG 解決 Implementation Error)
+  -- 時鐘生成：100MHz -> 50MHz
   --------------------------------------------------
   process(sys_clk, reset)
   begin
@@ -189,46 +191,73 @@ begin
     end if;
   end process;
 
-  -- 這是關鍵：將一般邏輯產生的時鐘放入全域時鐘樹
-  u_bufg : BUFG
-    port map (
-      I => pixel_clk_raw,
-      O => pixel_clk
-    );
+  u_bufg : BUFG port map (I => pixel_clk_raw, O => pixel_clk);
 
   --------------------------------------------------
-  -- 按鍵去彈跳/同步
+  -- 序列控制器 (解決臉部轉動/位移)
   --------------------------------------------------
   process(sys_clk, reset)
   begin
     if reset='1' then
       start_sync1 <= '0';
       start_sync2 <= '0';
-      start_prev  <= '0';
-      start_pulse <= '0';
+      seq_cnt     <= 0;
+      seq_running <= '0';
+      canny_reset_internal <= '0';
+      rom_start_internal   <= '0';
+      
     elsif rising_edge(sys_clk) then
       start_sync1 <= start;
       start_sync2 <= start_sync1;
-      start_pulse <= '0';
-      if start_sync2='1' and start_prev='0' then
-        start_pulse <= '1';
+      
+      -- 偵測上升沿
+      if start_sync2='1' and start_sync1='0' then 
+         seq_running <= '1';
+         seq_cnt     <= 0;
       end if;
-      start_prev <= start_sync2;
+
+      if seq_running = '1' then
+        if seq_cnt < 30 then
+          seq_cnt <= seq_cnt + 1;
+        else
+          seq_running <= '0';
+        end if;
+        
+        -- 0~10: 強制 Reset Canny 與 Writer
+        if seq_cnt >= 0 and seq_cnt <= 10 then
+           canny_reset_internal <= '1';
+           rom_start_internal   <= '0';
+           
+        -- 11~20: 放開 Reset
+        elsif seq_cnt > 10 and seq_cnt <= 20 then
+           canny_reset_internal <= '0';
+           rom_start_internal   <= '0';
+           
+        -- 21: 啟動
+        elsif seq_cnt = 21 then
+           canny_reset_internal <= '0';
+           rom_start_internal   <= '1';
+           
+        else
+           canny_reset_internal <= '0';
+           rom_start_internal   <= '0';
+        end if;
+      else
+        canny_reset_internal <= '0';
+        rom_start_internal   <= '0';
+      end if;
     end if;
   end process;
 
-  -- 修正後的重置訊號：只給 Canny 用
-  canny_reset <= reset or start_pulse;
-
   --------------------------------------------------
-  -- 1. 影像輸入源 (ROM)
+  -- 模組連接
   --------------------------------------------------
   u_feed : pixel_feed_rom
     generic map (IMG_W=>IN_W, IMG_H=>IN_H, ADDR_BITS=>14, PIX_BITS=>8, RUN_ONCE=>true)
     port map (
       clk        => sys_clk,
-      reset      => reset,        -- Feed 不需要 soft reset
-      start      => start_pulse,
+      reset      => reset,
+      start      => rom_start_internal,
       rom_addr   => feed_addr,
       rom_dout   => feed_dout,
       pixelIn    => pixelIn,
@@ -244,13 +273,10 @@ begin
       douta => feed_dout
     );
 
-  --------------------------------------------------
-  -- 2. Canny 演算法核心 (使用 canny_reset)
-  --------------------------------------------------
   u_canny : canny_dut_step_modular_fixpt
     port map (
       clk          => sys_clk,
-      reset        => canny_reset,  -- **這裡維持強制重置，清空 Buffer**
+      reset        => canny_reset_internal,
       clk_enable   => '1',
       pixelIn      => pixelIn,
       pixelValid   => pixelValid,
@@ -264,18 +290,14 @@ begin
       edgeValid    => edgeValid
     );
 
-  --------------------------------------------------
-  -- 3. 寫入器 (修正：使用一般 reset)
-  --------------------------------------------------
-  -- 原因：Writer 內部是 Async Reset，如果接 start_pulse 會導致它在 start 當下被重置而忽略啟動指令
   u_writer : edge_frame_writer
     generic map (IN_W=>IN_W, IN_H=>IN_H, ADDR_BITS=>14)
     port map (
       clk        => sys_clk,
-      reset      => reset,      -- **改回一般 reset，不要接 start_pulse**
+      reset      => reset,                
       edgePix    => edgePix,
       edgeValid  => edgeValid,
-      start      => start_pulse,
+      start      => rom_start_internal,   
       done_in    => frame_done,
       ram_we     => w_we,
       ram_addr   => w_addr,
@@ -283,9 +305,6 @@ begin
       write_done => w_done
     );
 
-  --------------------------------------------------
-  -- 4. 雙埠 RAM
-  --------------------------------------------------
   u_edge_ram : dual_port_edge_ram
     generic map (DATA_BITS=>8, ADDR_BITS=>14)
     port map (
@@ -293,33 +312,20 @@ begin
       we_a   => w_we,
       addr_a => w_addr,
       din_a  => w_din,
-      
-      clk_b  => pixel_clk,  -- 使用 BUFG 後的穩定的 50MHz
+      clk_b  => pixel_clk,
       addr_b => vga_addr,
       dout_b => vga_dout
     );
 
-  --------------------------------------------------
-  -- 5. VGA 顯示控制器
-  --------------------------------------------------
+  -- **修正後的 Generic Map**：直接使用預設值，不手動 Map 細項以避免語法錯誤
   u_vga : vga_edge_display
     generic map (
-      H_RES   => 800,
-      H_FP    => 56,
-      H_SYNC  => 120,
-      H_BP    => 64,
-      H_POL   => '1',
-      V_RES   => 600,
-      V_FP    => 37,
-      V_SYNC  => 6,
-      V_BP    => 23,
-      V_POL   => '1',
       IN_W    => IN_W,
       IN_H    => IN_H,
       SCALE_K => 4 
     )
     port map (
-      pixel_clk => pixel_clk, -- 使用 BUFG 後的穩定的 50MHz
+      pixel_clk => pixel_clk,
       reset     => reset,
       ram_dout  => vga_dout,
       ram_addr  => vga_addr,
