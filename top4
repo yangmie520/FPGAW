@@ -1,0 +1,339 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+library UNISIM;
+use UNISIM.vcomponents.all;
+
+entity top_canny_vga_comp is
+  port (
+    sys_clk   : in  std_logic;            -- 100 MHz
+    reset     : in  std_logic;
+    start     : in  std_logic;
+
+    -- VGA 輸出
+    o_h_sync  : out std_logic;
+    o_v_sync  : out std_logic;
+    o_red     : out std_logic_vector(3 downto 0);
+    o_green   : out std_logic_vector(3 downto 0);
+    o_blue    : out std_logic_vector(3 downto 0)
+  );
+end entity;
+
+architecture rtl of top_canny_vga_comp is
+  -- 影像尺寸
+  constant IN_W : integer := 100;
+  constant IN_H : integer := 100;
+
+  -- Canny 閾值
+  constant LOW_T  : std_logic_vector(6 downto 0) := "0101101";    -- 45
+  constant HIGH_T : std_logic_vector(8 downto 0) := "010000111";  -- 135
+
+  -- 時鐘訊號
+  signal div_reg       : std_logic := '0';
+  signal pixel_clk_raw : std_logic := '0';
+  signal pixel_clk     : std_logic;
+
+  -- 按鍵同步
+  signal start_sync1, start_sync2 : std_logic := '0';
+  signal start_pulse              : std_logic := '0';
+
+  -- 序列控制器訊號
+  signal seq_cnt      : integer range 0 to 31 := 0;
+  signal seq_running  : std_logic := '0';
+  signal canny_reset_internal : std_logic := '0';
+  signal rom_start_internal   : std_logic := '0';
+
+  -- 內部連接信號
+  signal pixelIn     : std_logic_vector(8 downto 0);
+  signal pixelValid  : std_logic;
+  signal sof         : std_logic;
+  signal edgePix     : std_logic_vector(8 downto 0);
+  signal edgeValid   : std_logic;
+  signal frame_done  : std_logic;
+
+  signal feed_addr   : std_logic_vector(13 downto 0);
+  signal feed_dout   : std_logic_vector(7 downto 0);
+
+  signal w_we        : std_logic;
+  signal w_addr      : unsigned(13 downto 0);
+  signal w_din       : std_logic_vector(7 downto 0);
+  signal w_done      : std_logic;
+
+  signal vga_addr    : unsigned(13 downto 0);
+  signal vga_dout    : std_logic_vector(7 downto 0);
+
+  -- Component 宣告
+  component img_bram
+    port (
+      clka  : in  std_logic;
+      addra : in  std_logic_vector(13 downto 0);
+      douta : out std_logic_vector(7 downto 0)
+    );
+  end component;
+
+  component canny_dut_step_modular_fixpt
+    port (
+      clk          : in  std_logic;
+      reset        : in  std_logic;
+      clk_enable   : in  std_logic;
+      pixelIn      : in  std_logic_vector(8 downto 0);
+      pixelValid   : in  std_logic;
+      lowT         : in  std_logic_vector(6 downto 0);
+      highT        : in  std_logic_vector(8 downto 0);
+      imageWidth   : in  std_logic_vector(9 downto 0);
+      imageHeight  : in  std_logic_vector(10 downto 0);
+      sof          : in  std_logic;
+      ce_out       : out std_logic;
+      edgePix      : out std_logic_vector(8 downto 0);
+      edgeValid    : out std_logic
+    );
+  end component;
+
+  component pixel_feed_rom
+    generic (
+      IMG_W     : integer;
+      IMG_H     : integer;
+      ADDR_BITS : integer;
+      PIX_BITS  : integer;
+      RUN_ONCE  : boolean
+    );
+    port (
+      clk        : in  std_logic;
+      reset      : in  std_logic;
+      start      : in  std_logic;
+      rom_addr   : out std_logic_vector(ADDR_BITS-1 downto 0);
+      rom_dout   : in  std_logic_vector(PIX_BITS-1 downto 0);
+      pixelIn    : out std_logic_vector(8 downto 0);
+      pixelValid : out std_logic;
+      sof        : out std_logic;
+      frame_done : out std_logic
+    );
+  end component;
+
+  component edge_frame_writer
+    generic (
+      IN_W      : integer;
+      IN_H      : integer;
+      ADDR_BITS : integer
+    );
+    port (
+      clk        : in  std_logic;
+      reset      : in  std_logic;
+      edgePix    : in  std_logic_vector(8 downto 0);
+      edgeValid  : in  std_logic;
+      start      : in  std_logic;
+      done_in    : in  std_logic;
+      ram_we     : out std_logic;
+      ram_addr   : out unsigned(ADDR_BITS-1 downto 0);
+      ram_din    : out std_logic_vector(7 downto 0);
+      write_done : out std_logic
+    );
+  end component;
+
+  component dual_port_edge_ram
+    generic (
+      DATA_BITS : integer;
+      ADDR_BITS : integer
+    );
+    port (
+      clk_a   : in  std_logic;
+      we_a    : in  std_logic;
+      addr_a  : in  unsigned(ADDR_BITS-1 downto 0);
+      din_a   : in  std_logic_vector(DATA_BITS-1 downto 0);
+      clk_b   : in  std_logic;
+      addr_b  : in  unsigned(ADDR_BITS-1 downto 0);
+      dout_b  : out std_logic_vector(DATA_BITS-1 downto 0)
+    );
+  end component;
+
+  -- 修正後的 VGA Component 宣告 (加入 Default Value)
+  component vga_edge_display
+    generic(
+      H_RES   : integer := 800;
+      H_FP    : integer := 56;
+      H_SYNC  : integer := 120;
+      H_BP    : integer := 64;
+      H_POL   : std_logic := '1';
+      V_RES   : integer := 600;
+      V_FP    : integer := 37;
+      V_SYNC  : integer := 6;
+      V_BP    : integer := 23;
+      V_POL   : std_logic := '1';
+      IN_W    : integer := 100;
+      IN_H    : integer := 100;
+      SCALE_K : integer := 4
+    );
+    port (
+      pixel_clk : in  std_logic;
+      reset     : in  std_logic;
+      ram_dout  : in  std_logic_vector(7 downto 0);
+      ram_addr  : out unsigned(13 downto 0);
+      o_h_sync  : out std_logic;
+      o_v_sync  : out std_logic;
+      o_red     : out std_logic_vector(3 downto 0);
+      o_green   : out std_logic_vector(3 downto 0);
+      o_blue    : out std_logic_vector(3 downto 0)
+    );
+  end component;
+
+begin
+  --------------------------------------------------
+  -- 時鐘生成：100MHz -> 50MHz
+  --------------------------------------------------
+  process(sys_clk, reset)
+  begin
+    if reset='1' then
+      div_reg       <= '0';
+      pixel_clk_raw <= '0';
+    elsif rising_edge(sys_clk) then
+      div_reg       <= not div_reg;
+      pixel_clk_raw <= div_reg; 
+    end if;
+  end process;
+
+  u_bufg : BUFG port map (I => pixel_clk_raw, O => pixel_clk);
+
+  --------------------------------------------------
+  -- 序列控制器 (解決臉部轉動/位移)
+  --------------------------------------------------
+  process(sys_clk, reset)
+  begin
+    if reset='1' then
+      start_sync1 <= '0';
+      start_sync2 <= '0';
+      seq_cnt     <= 0;
+      seq_running <= '0';
+      canny_reset_internal <= '0';
+      rom_start_internal   <= '0';
+      
+    elsif rising_edge(sys_clk) then
+      start_sync1 <= start;
+      start_sync2 <= start_sync1;
+      
+      -- 偵測上升沿
+      if start_sync2='1' and start_sync1='0' then 
+         seq_running <= '1';
+         seq_cnt     <= 0;
+      end if;
+
+      if seq_running = '1' then
+        if seq_cnt < 30 then
+          seq_cnt <= seq_cnt + 1;
+        else
+          seq_running <= '0';
+        end if;
+        
+        -- 0~10: 強制 Reset Canny 與 Writer
+        if seq_cnt >= 0 and seq_cnt <= 10 then
+           canny_reset_internal <= '1';
+           rom_start_internal   <= '0';
+           
+        -- 11~20: 放開 Reset
+        elsif seq_cnt > 10 and seq_cnt <= 20 then
+           canny_reset_internal <= '0';
+           rom_start_internal   <= '0';
+           
+        -- 21: 啟動
+        elsif seq_cnt = 21 then
+           canny_reset_internal <= '0';
+           rom_start_internal   <= '1';
+           
+        else
+           canny_reset_internal <= '0';
+           rom_start_internal   <= '0';
+        end if;
+      else
+        canny_reset_internal <= '0';
+        rom_start_internal   <= '0';
+      end if;
+    end if;
+  end process;
+
+  --------------------------------------------------
+  -- 模組連接
+  --------------------------------------------------
+  u_feed : pixel_feed_rom
+    generic map (IMG_W=>IN_W, IMG_H=>IN_H, ADDR_BITS=>14, PIX_BITS=>8, RUN_ONCE=>true)
+    port map (
+      clk        => sys_clk,
+      reset      => reset,
+      start      => rom_start_internal,
+      rom_addr   => feed_addr,
+      rom_dout   => feed_dout,
+      pixelIn    => pixelIn,
+      pixelValid => pixelValid,
+      sof        => sof,
+      frame_done => frame_done
+    );
+
+  u_img_bram : img_bram
+    port map (
+      clka  => sys_clk,
+      addra => feed_addr,
+      douta => feed_dout
+    );
+
+  u_canny : canny_dut_step_modular_fixpt
+    port map (
+      clk          => sys_clk,
+      reset        => canny_reset_internal,
+      clk_enable   => '1',
+      pixelIn      => pixelIn,
+      pixelValid   => pixelValid,
+      lowT         => LOW_T,
+      highT        => HIGH_T,
+      imageWidth   => std_logic_vector(to_unsigned(IN_W,10)),
+      imageHeight  => std_logic_vector(to_unsigned(IN_H,11)),
+      sof          => sof,
+      ce_out       => open,
+      edgePix      => edgePix,
+      edgeValid    => edgeValid
+    );
+
+  u_writer : edge_frame_writer
+    generic map (IN_W=>IN_W, IN_H=>IN_H, ADDR_BITS=>14)
+    port map (
+      clk        => sys_clk,
+      reset      => reset,                
+      edgePix    => edgePix,
+      edgeValid  => edgeValid,
+      start      => rom_start_internal,   
+      done_in    => frame_done,
+      ram_we     => w_we,
+      ram_addr   => w_addr,
+      ram_din    => w_din,
+      write_done => w_done
+    );
+
+  u_edge_ram : dual_port_edge_ram
+    generic map (DATA_BITS=>8, ADDR_BITS=>14)
+    port map (
+      clk_a  => sys_clk,
+      we_a   => w_we,
+      addr_a => w_addr,
+      din_a  => w_din,
+      clk_b  => pixel_clk,
+      addr_b => vga_addr,
+      dout_b => vga_dout
+    );
+
+  -- **修正後的 Generic Map**：直接使用預設值
+  u_vga : vga_edge_display
+    generic map (
+      IN_W    => IN_W,
+      IN_H    => IN_H,
+      SCALE_K => 4 
+    )
+    port map (
+      pixel_clk => pixel_clk,
+      reset     => reset,
+      ram_dout  => vga_dout,
+      ram_addr  => vga_addr,
+      o_h_sync  => o_h_sync,
+      o_v_sync  => o_v_sync,
+      o_red     => o_red,
+      o_green   => o_green,
+      o_blue    => o_blue
+    );
+
+end architecture;
